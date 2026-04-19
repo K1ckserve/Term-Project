@@ -1,0 +1,4 @@
+strategy,dataset_size,seed_rounds_used,em_iterations,seed_time_s,em_time_s,total_time_s,peak_mem_mb,inertia
+kmeans++,10000,N/A,23,0.0413,1.5093,1.5506,0.0,1125253.12
+kmeans||_fixed_R2,10000,2,23,0.0363,0.0051,0.0414,0.02,1356700.88
+kmeans||_adaptive,10000,3,23,0.8088,0.0057,0.8145,0.11,1163356.75
