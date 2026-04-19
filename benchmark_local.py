@@ -6,6 +6,7 @@ import time
 import tracemalloc
 import numpy as np
 import csv
+from scipy.spatial.distance import cdist
 from sklearn.datasets import make_blobs
 from sklearn.cluster import KMeans
 from joblib import Parallel, delayed
@@ -15,6 +16,9 @@ K = 20
 DATASET_SIZES = [10_000, 100_000, 1_000_000]
 RESULTS_DIR = "results"
 OVERSAMPLE_FACTOR = 2.0
+
+MAX_METRIC_SAMPLE = 10_000
+_metric_rng = np.random.default_rng(RANDOM_SEED)
 
 
 # ---------------------------------------------------------------------------
@@ -76,18 +80,11 @@ def _sample_candidates(X: np.ndarray, centers: np.ndarray, oversample: int,
     return X[mask]
 
 
-def _min_sq_dist(X: np.ndarray, centers: np.ndarray) -> np.ndarray:
-    """Minimum squared distance from each point to the nearest center."""
-    # Chunked to avoid huge allocations
-    chunk = 4096
-    D = np.full(len(X), np.inf, dtype=np.float64)
-    for i in range(0, len(centers), chunk):
-        c_chunk = centers[i : i + chunk]
-        # (n, chunk) distance matrix
-        diff = X[:, np.newaxis, :].astype(np.float64) - c_chunk[np.newaxis, :, :]
-        d = np.sum(diff ** 2, axis=2)
-        D = np.minimum(D, d.min(axis=1))
-    return D
+def _min_sq_dist(X, centers):
+    # cdist computes pairwise distances without a 3D intermediate array
+    # shape: (n_points, n_centers) — memory scales linearly, not cubically
+    dists = cdist(X, centers, metric='sqeuclidean')
+    return dists.min(axis=1)
 
 
 def _reduce_to_k(candidates: np.ndarray, k: int) -> np.ndarray:
@@ -121,6 +118,13 @@ def fixed_kmeans_parallel(X: np.ndarray, k: int, R: int = 2,
 # ---------------------------------------------------------------------------
 # Adaptive k-means|| seeding (the contribution)
 # ---------------------------------------------------------------------------
+
+def _metric_sample(X):
+    if len(X) > MAX_METRIC_SAMPLE:
+        idx = _metric_rng.choice(len(X), MAX_METRIC_SAMPLE, replace=False)
+        return X[idx]
+    return X
+
 
 def _quality_metric(centers: np.ndarray) -> float:
     """
@@ -160,12 +164,21 @@ def _quality_metric(centers: np.ndarray) -> float:
     return min_dist / (mean_var + 1e-10)
 
 
+def _auto_epsilon(n: int) -> float:
+    if n < 50_000:
+        return 0.05
+    elif n < 500_000:
+        return 0.02
+    else:
+        return 0.01
+
+
 def adaptive_kmeans_parallel(
     X: np.ndarray,
     k: int,
     oversample_factor: float = OVERSAMPLE_FACTOR,
-    epsilon: float = 0.01,
-    max_rounds: int = 10,
+    epsilon: float | None = None,
+    max_rounds: int = 5,
     n_jobs: int = -1,
 ) -> np.ndarray:
     """
@@ -174,9 +187,11 @@ def adaptive_kmeans_parallel(
     After each oversampling round, compute a quality metric over the current
     candidate centers. Stop when |metric(round r) - metric(round r-1)| < epsilon,
     meaning further rounds are adding diminishing returns.
-
+    
     Returns: initial_centers of shape [k, d].
     """
+    if epsilon is None:
+        epsilon = _auto_epsilon(len(X))
     rng = np.random.default_rng(RANDOM_SEED)
     oversample = int(oversample_factor * k)
 
@@ -210,7 +225,7 @@ def adaptive_kmeans_parallel(
 
         # Step 4: compute quality metric on the *reduced* candidate set
         # (reduce first so metric is computed on a representative k-sized set)
-        candidate_centers = _reduce_to_k(centers, k)
+        candidate_centers = _reduce_to_k(_metric_sample(centers), k)
         metric = _quality_metric(candidate_centers)
 
         # Step 5: check convergence — stop if metric change is below epsilon

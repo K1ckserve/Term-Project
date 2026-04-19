@@ -4,6 +4,7 @@ Spark benchmark: fixed k-means||, adaptive seeding via coreset, k-means++ via co
 import os
 import time
 import csv
+import sys
 import numpy as np
 from sklearn.datasets import make_blobs
 
@@ -24,6 +25,8 @@ from benchmark_local import (
     make_dataset,
 )
 
+os.environ["PYSPARK_PYTHON"] = r"C:\PROGRA~1\Python312\python.exe"
+os.environ["PYSPARK_DRIVER_PYTHON"] = r"C:\PROGRA~1\Python312\python.exe"
 CORESET_SIZE = 5_000  # sample size for adaptive/++ preprocessing
 
 
