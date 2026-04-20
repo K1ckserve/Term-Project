@@ -174,14 +174,15 @@ def kmeans_plus_plus(X: np.ndarray, k: int,
 # ---------------------------------------------------------------------------
 
 def fixed_kmeans_parallel(X: np.ndarray, k: int, R: int = 2,
-                           oversample_factor: float = OVERSAMPLE_FACTOR
+                           oversample_factor: float = OVERSAMPLE_FACTOR,
+                           seed: int = RANDOM_SEED,
                            ) -> np.ndarray:
     """
     Fixed-round k-means|| seeding — runs exactly R oversampling rounds.
     Uses the same BLAS primitives and incremental-update strategy as the
     adaptive variant so the two differ only in their stopping rule.
     """
-    rng = np.random.default_rng(RANDOM_SEED)
+    rng = np.random.default_rng(seed)
     n = len(X)
     oversample = oversample_factor * k
     X_sq = np.einsum("ij,ij->i", X, X)
@@ -219,6 +220,7 @@ def adaptive_kmeans_parallel(
     epsilon: float = EPSILON,
     max_rounds: int = min(MAX_ROUNDS, 3),
     profile: bool = False,
+    seed: int = RANDOM_SEED,
 ):
     """
     Adaptive k-means|| seeding.
@@ -246,7 +248,7 @@ def adaptive_kmeans_parallel(
     (centers, rounds_used)                if profile=False
     (centers, rounds_used, timings_dict)  if profile=True
     """
-    rng = np.random.default_rng(RANDOM_SEED)
+    rng = np.random.default_rng(seed)
     n = len(X)
     epsilon_scaled = epsilon * max(1.0, min(np.log10(n / 10_000), 1.5))
     oversample = oversample_factor * k * 3
