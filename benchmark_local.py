@@ -95,7 +95,6 @@ def _update_min_dist_inplace(X: np.ndarray, new_centers: np.ndarray,
     new_min = new_D.min(axis=1)
     np.minimum(min_sq_dist, new_min, out=min_sq_dist)
 
-
 def _reduce_to_k(X: np.ndarray, candidates: np.ndarray, k: int, 
                  X_sq: np.ndarray) -> np.ndarray:
     """Weighted k-means on the candidate set to reduce to exactly k centers."""
@@ -120,7 +119,6 @@ def _reduce_to_k(X: np.ndarray, candidates: np.ndarray, k: int,
     km.fit(candidates, sample_weight=weights) 
     
     return km.cluster_centers_.astype(np.float32)
-
 
 # ---------------------------------------------------------------------------
 # Baseline 1: k-means++
@@ -187,6 +185,9 @@ def fixed_kmeans_parallel(X: np.ndarray, k: int, R: int = 2,
         probs = min_sq / phi
         mask = rng.random(n) < (oversample * probs)
         new_pts = X[mask]
+        if len(new_pts) > 2 * k:
+            idx = rng.choice(len(new_pts), size=2*k, replace=False)
+            new_pts = new_pts[idx]
         if len(new_pts) == 0:
             continue
         _update_min_dist_inplace(X, new_pts, min_sq, X_sq)
@@ -204,7 +205,7 @@ def adaptive_kmeans_parallel(
     k: int,
     oversample_factor: float = OVERSAMPLE_FACTOR,
     epsilon: float = EPSILON,
-    max_rounds: int = MAX_ROUNDS,
+    max_rounds: int = min(MAX_ROUNDS, 3),
     profile: bool = False,
 ):
     """
@@ -235,7 +236,8 @@ def adaptive_kmeans_parallel(
     """
     rng = np.random.default_rng(RANDOM_SEED)
     n = len(X)
-    oversample = oversample_factor * k
+    epsilon_scaled = epsilon * max(1.0, min(np.log10(n / 10_000), 1.5))
+    oversample = oversample_factor * k * 3
 
     timings: dict | None = None
     if profile:
@@ -269,6 +271,9 @@ def adaptive_kmeans_parallel(
         probs = min_sq / phi
         mask = rng.random(n) < (oversample * probs)
         new_pts = X[mask]
+        if len(new_pts) >  int(2*k/2):
+            idx = rng.choice(len(new_pts), size=int(2*k/2), replace=False)
+            new_pts = new_pts[idx]
         sample_s = time.perf_counter() - t_sample
         if len(new_pts) == 0:
             break
@@ -276,9 +281,15 @@ def adaptive_kmeans_parallel(
         # Update running phi against only the new centers (not all prior).
         t_update = time.perf_counter()
         _update_min_dist_inplace(X, new_pts, min_sq, X_sq)
+        # CHUNK_SIZE = 50000
+        # for i in range(0,n,CHUNK_SIZE):
+        #     chunk = X[i:i + CHUNK_SIZE]
+        #     _update_min_dist_inplace(chunk, new_pts, min_sq[i:i+CHUNK_SIZE], X_sq[i:i+CHUNK_SIZE])
         centers_list.append(new_pts)
         phi_new = float(min_sq.sum())
         update_s = time.perf_counter() - t_update
+        if phi_new / n < 1e-10:
+            break
 
         # Relative-improvement stopping rule.
         t_stop = time.perf_counter()
@@ -295,7 +306,7 @@ def adaptive_kmeans_parallel(
             timings["phi"].append(phi)
             timings["rel_improvement"].append(rel_improvement)
 
-        if rel_improvement < epsilon:
+        if rel_improvement < epsilon_scaled:
             break
 
     # --- final reduction to k centers -----------------------------------
