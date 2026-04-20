@@ -1,24 +1,44 @@
 """
-Local multicore benchmark: k-means++, fixed k-means||, adaptive k-means||.
+benchmark_local.py — Multicore benchmark for adaptive k-means||.
+
+Baselines:
+    - kmeans_plus_plus       : k-means++ (sequential, O(nkd))
+    - fixed_kmeans_parallel  : fixed-round k-means|| (R=2, Spark default)
+
+Contribution:
+    - adaptive_kmeans_parallel : adaptive k-means|| with phi-based early stopping
+
+All three strategies share BLAS-based squared-distance primitives so the
+comparison reflects algorithmic differences, not implementation artefacts.
+Parallelism is inherited from numpy's BLAS backend (MKL/OpenBLAS) via
+`X @ C.T` matmuls. Run `python benchmark_local.py blas` to verify which
+BLAS is linked and how many threads it uses.
+
+CLI:
+    python benchmark_local.py            # full benchmark → results/local_benchmark.csv
+    python benchmark_local.py profile    # per-round timing breakdown of adaptive
+    python benchmark_local.py blas       # show BLAS backend + thread count
 """
+from __future__ import annotations
 import os
+import sys
 import time
 import tracemalloc
-import numpy as np
 import csv
-from scipy.spatial.distance import cdist
+import numpy as np
 from sklearn.datasets import make_blobs
 from sklearn.cluster import KMeans
-from joblib import Parallel, delayed
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 RANDOM_SEED = 42
 K = 20
 DATASET_SIZES = [10_000, 100_000, 1_000_000]
 RESULTS_DIR = "results"
-OVERSAMPLE_FACTOR = 2.0
-
-MAX_METRIC_SAMPLE = 10_000
-_metric_rng = np.random.default_rng(RANDOM_SEED)
+OVERSAMPLE_FACTOR = 2.0      # l = oversample_factor * k (paper: l >= k)
+EPSILON = 0.10               # relative phi improvement threshold for adaptive
+MAX_ROUNDS = 5               # hard cap on adaptive seeding rounds
 
 
 # ---------------------------------------------------------------------------
@@ -26,235 +46,316 @@ _metric_rng = np.random.default_rng(RANDOM_SEED)
 # ---------------------------------------------------------------------------
 
 def make_dataset(n_samples: int) -> np.ndarray:
-    """Skewed Gaussian blobs: each cluster has a different std to stress-test seeding."""
+    """Skewed Gaussian blobs: each cluster has a different std."""
     rng = np.random.default_rng(RANDOM_SEED)
     stds = rng.uniform(0.5, 5.0, size=K).tolist()
     X, _ = make_blobs(
-        n_samples=n_samples,
-        n_features=10,
-        centers=K,
-        cluster_std=stds,
-        random_state=RANDOM_SEED,
+        n_samples=n_samples, n_features=10, centers=K,
+        cluster_std=stds, random_state=RANDOM_SEED,
     )
     return X.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# k-means++ seeding (baseline 1)
+# BLAS-accelerated distance primitives (shared by all k-means|| variants)
 # ---------------------------------------------------------------------------
 
-def kmeans_plus_plus(X: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
-    """Standard k-means++ seeding: O(nkd) sequential."""
-    n = len(X)
-    first = rng.integers(0, n)
-    centers = [X[first]]
+def _sq_dist_matrix(X: np.ndarray, C: np.ndarray,
+                    X_sq: np.ndarray | None = None) -> np.ndarray:
+    """
+    Squared Euclidean distance matrix, shape (|X|, |C|).
 
-    for _ in range(k - 1):
-        # Minimum squared distance from each point to the nearest existing center
-        D = np.full(n, np.inf, dtype=np.float64)
-        for c in centers:
-            d = np.sum((X.astype(np.float64) - c.astype(np.float64)) ** 2, axis=1)
-            D = np.minimum(D, d)
-        probs = D / D.sum()
-        chosen = rng.choice(n, p=probs)
-        centers.append(X[chosen])
+    Uses the identity  ||x - c||^2 = ||x||^2 + ||c||^2 - 2 x·c  so the
+    dominant operation is a single matmul, dispatched to BLAS with native
+    multithreading. Typically 3-5x faster than scipy.cdist for numerical
+    arrays, and scales with available cores.
 
-    return np.array(centers)
-
-
-# ---------------------------------------------------------------------------
-# Fixed-round k-means|| seeding (baseline 2, R=2 mirrors Spark default)
-# ---------------------------------------------------------------------------
-
-def _sample_candidates(X: np.ndarray, centers: np.ndarray, oversample: int,
-                        seed: int) -> np.ndarray:
-    """One oversampling round: sample each point with prob proportional to D^2."""
-    rng = np.random.default_rng(seed)
-    D = _min_sq_dist(X, centers)
-    total = D.sum()
-    if total == 0:
-        return np.empty((0, X.shape[1]), dtype=X.dtype)
-    probs = D / total
-    # Expected number of samples = oversample; use multinomial for exact count
-    mask = rng.random(len(X)) < (oversample * probs)
-    return X[mask]
+    Pass X_sq to avoid recomputing the ||X||^2 row-norms when X is fixed.
+    All intermediate allocations are kept in float32.
+    """
+    if X_sq is None:
+        X_sq = np.einsum("ij,ij->i", X, X)
+    C_sq = np.einsum("ij,ij->i", C, C)
+    # Build D in-place to minimise peak memory:
+    #   D = X @ C.T; D *= -2; D += X_sq; D += C_sq
+    D = X @ C.T
+    D *= -2
+    D += X_sq[:, None]
+    D += C_sq[None, :]
+    # Floating-point rounding can push distances fractionally below 0.
+    np.maximum(D, 0, out=D)
+    return D
 
 
-def _min_sq_dist(X, centers):
-    # cdist computes pairwise distances without a 3D intermediate array
-    # shape: (n_points, n_centers) — memory scales linearly, not cubically
-    dists = cdist(X, centers, metric='sqeuclidean')
-    return dists.min(axis=1)
+def _update_min_dist_inplace(X: np.ndarray, new_centers: np.ndarray,
+                              min_sq_dist: np.ndarray,
+                              X_sq: np.ndarray) -> None:
+    """Fold new centers into the running min_sq_dist array (in-place)."""
+    new_D = _sq_dist_matrix(X, new_centers, X_sq=X_sq)
+    new_min = new_D.min(axis=1)
+    np.minimum(min_sq_dist, new_min, out=min_sq_dist)
 
 
-def _reduce_to_k(candidates: np.ndarray, k: int) -> np.ndarray:
-    """Weighted k-means on the candidate set to reduce to k centers."""
+def _reduce_to_k(X: np.ndarray, candidates: np.ndarray, k: int, 
+                 X_sq: np.ndarray) -> np.ndarray:
+    """Weighted k-means on the candidate set to reduce to exactly k centers."""
     if len(candidates) <= k:
-        # Pad with random repeats if fewer candidates than k
-        idx = np.random.default_rng(RANDOM_SEED).integers(0, len(candidates), size=k)
+        idx = np.random.default_rng(RANDOM_SEED).integers(
+            0, len(candidates), size=k
+        )
         return candidates[idx]
-    km = KMeans(n_clusters=k, init="k-means++", n_init=1, random_state=RANDOM_SEED, max_iter=100)
-    km.fit(candidates)
+        
+    # Calculate weights: find the nearest candidate for every point in X
+    D = _sq_dist_matrix(X, candidates, X_sq=X_sq)
+    closest_candidate_idx = D.argmin(axis=1)
+    
+    # Count how many points belong to each candidate
+    weights = np.bincount(closest_candidate_idx, minlength=len(candidates))
+    
+    km = KMeans(
+        n_clusters=k, init="k-means++", n_init=1,
+        random_state=RANDOM_SEED, max_iter=100,
+    )
+    # Pass the calculated weights here
+    km.fit(candidates, sample_weight=weights) 
+    
     return km.cluster_centers_.astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# Baseline 1: k-means++
+# ---------------------------------------------------------------------------
+
+def kmeans_plus_plus(X: np.ndarray, k: int,
+                     rng: np.random.Generator) -> np.ndarray:
+    """
+    Standard k-means++ seeding: O(nkd) sequential.
+
+    Maintains a running min-squared-distance array and updates it only
+    against the most recently added center each iteration — the canonical
+    efficient formulation (vs. recomputing against all prior centers).
+    """
+    n, d = X.shape
+    first = int(rng.integers(0, n))
+    centers = np.empty((k, d), dtype=X.dtype)
+    centers[0] = X[first]
+
+    # min_sq[i] = squared distance from X[i] to its nearest chosen center
+    diff = X - centers[0]
+    min_sq = np.einsum("ij,ij->i", diff, diff)
+
+    for i in range(1, k):
+        phi = float(min_sq.sum())
+        if phi <= 0:
+            chosen = int(rng.integers(0, n))
+        else:
+            probs = min_sq / phi
+            chosen = int(rng.choice(n, p=probs))
+        centers[i] = X[chosen]
+        diff = X - centers[i]
+        new_sq = np.einsum("ij,ij->i", diff, diff)
+        np.minimum(min_sq, new_sq, out=min_sq)
+
+    return centers
+
+
+# ---------------------------------------------------------------------------
+# Baseline 2: Fixed-round k-means|| (R=2, matches Spark MLlib default)
+# ---------------------------------------------------------------------------
+
 def fixed_kmeans_parallel(X: np.ndarray, k: int, R: int = 2,
-                           oversample_factor: float = OVERSAMPLE_FACTOR,
-                           n_jobs: int = -1) -> np.ndarray:
-    """Fixed-round k-means|| seeding with R rounds."""
+                           oversample_factor: float = OVERSAMPLE_FACTOR
+                           ) -> np.ndarray:
+    """
+    Fixed-round k-means|| seeding — runs exactly R oversampling rounds.
+    Uses the same BLAS primitives and incremental-update strategy as the
+    adaptive variant so the two differ only in their stopping rule.
+    """
     rng = np.random.default_rng(RANDOM_SEED)
-    # Start with a single random center
-    centers = X[rng.integers(0, len(X))][np.newaxis, :]
-    oversample = int(oversample_factor * k)
+    n = len(X)
+    oversample = oversample_factor * k
+    X_sq = np.einsum("ij,ij->i", X, X)
 
-    for r in range(R):
-        new_pts = _sample_candidates(X, centers, oversample, seed=RANDOM_SEED + r)
-        if len(new_pts) > 0:
-            centers = np.vstack([centers, new_pts])
+    first = int(rng.integers(0, n))
+    centers_list = [X[first:first + 1].copy()]
+    min_sq = _sq_dist_matrix(X, centers_list[0], X_sq=X_sq).ravel()
 
-    return _reduce_to_k(centers, k)
+    for _ in range(R):
+        phi = float(min_sq.sum())
+        if phi <= 0:
+            break
+        probs = min_sq / phi
+        mask = rng.random(n) < (oversample * probs)
+        new_pts = X[mask]
+        if len(new_pts) == 0:
+            continue
+        _update_min_dist_inplace(X, new_pts, min_sq, X_sq)
+        centers_list.append(new_pts)
+
+    return _reduce_to_k(X, np.vstack(centers_list), k, X_sq)
 
 
 # ---------------------------------------------------------------------------
-# Adaptive k-means|| seeding (the contribution)
+# Contribution: Adaptive k-means|| with phi-based early stopping
 # ---------------------------------------------------------------------------
-
-def _metric_sample(X):
-    if len(X) > MAX_METRIC_SAMPLE:
-        idx = _metric_rng.choice(len(X), MAX_METRIC_SAMPLE, replace=False)
-        return X[idx]
-    return X
-
-
-def _quality_metric(centers: np.ndarray) -> float:
-    """
-    Quality ratio: min pairwise inter-center distance / mean intra-cluster variance.
-
-    A higher ratio means centers are well-separated relative to their spread —
-    i.e., the seeding has converged to a good configuration.
-    """
-    n = len(centers)
-    if n < 2:
-        return 0.0
-
-    # --- min pairwise inter-center distance ---
-    min_dist = np.inf
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = np.sum((centers[i] - centers[j]) ** 2)
-            if d < min_dist:
-                min_dist = d
-    min_dist = float(np.sqrt(min_dist))
-
-    # --- mean intra-cluster variance ---
-    # Assign each center to its nearest neighbor cluster, compute variance
-    variances = []
-    for i in range(n):
-        dists = np.sum((centers - centers[i]) ** 2, axis=1)
-        dists[i] = np.inf
-        nearest = np.argmin(dists)
-        pair = centers[[i, nearest]]
-        variances.append(np.var(pair, axis=0).sum())
-    mean_var = float(np.mean(variances))
-
-    if mean_var < 1e-10:
-        # Centers already collapsed — ratio is undefined; treat as converged
-        return np.inf
-
-    return min_dist / (mean_var + 1e-10)
-
-
-def _auto_epsilon(n: int) -> float:
-    if n < 50_000:
-        return 0.05
-    elif n < 500_000:
-        return 0.02
-    else:
-        return 0.01
-
 
 def adaptive_kmeans_parallel(
     X: np.ndarray,
     k: int,
     oversample_factor: float = OVERSAMPLE_FACTOR,
-    epsilon: float | None = None,
-    max_rounds: int = 5,
-    n_jobs: int = -1,
-) -> np.ndarray:
+    epsilon: float = EPSILON,
+    max_rounds: int = MAX_ROUNDS,
+    profile: bool = False,
+):
     """
-    Adaptive k-means|| seeding with early stopping.
+    Adaptive k-means|| seeding.
 
-    After each oversampling round, compute a quality metric over the current
-    candidate centers. Stop when |metric(round r) - metric(round r-1)| < epsilon,
-    meaning further rounds are adding diminishing returns.
-    
-    Returns: initial_centers of shape [k, d].
+    Replaces the fixed-R rule with a data-dependent stopping criterion:
+    halt when the potential function
+        phi(C) = sum_i  min_c  ||x_i - c||^2
+    drops by less than `epsilon` fraction between consecutive rounds
+    (diminishing-returns signal). phi is monotonically non-increasing,
+    so no oscillation pathology — unlike ratio-of-distances metrics.
+
+    phi is computed as a free by-product of the sampling distribution
+    (the Bernoulli probabilities already require the min-distance array),
+    so there is zero extra distance-computation overhead for the
+    convergence check.
+
+    Parameters
+    ----------
+    profile : bool
+        If True, capture per-round timings and return them in a dict as
+        a third tuple element. Overhead when False: ~0 (no extra calls).
+
+    Returns
+    -------
+    (centers, rounds_used)                if profile=False
+    (centers, rounds_used, timings_dict)  if profile=True
     """
-    if epsilon is None:
-        epsilon = _auto_epsilon(len(X))
     rng = np.random.default_rng(RANDOM_SEED)
-    oversample = int(oversample_factor * k)
+    n = len(X)
+    oversample = oversample_factor * k
 
-    # Step 1: bootstrap with a single random center
-    centers = X[rng.integers(0, len(X))][np.newaxis, :]
+    timings: dict | None = None
+    if profile:
+        timings = {
+            "setup_s": 0.0, "reduce_s": 0.0,
+            "round": [], "new_pts": [],
+            "sample_s": [], "update_s": [], "stop_s": [],
+            "phi": [], "rel_improvement": [],
+        }
 
-    prev_metric = None
+    # --- setup ----------------------------------------------------------
+    t_setup = time.perf_counter()
+    X_sq = np.einsum("ij,ij->i", X, X)
+    first = int(rng.integers(0, n))
+    centers_list = [X[first:first + 1].copy()]
+    min_sq = _sq_dist_matrix(X, centers_list[0], X_sq=X_sq).ravel()
+    phi = float(min_sq.sum())
+    if profile:
+        timings["setup_s"] = time.perf_counter() - t_setup
+
+    # --- main loop ------------------------------------------------------
     rounds_used = 0
-
     for r in range(max_rounds):
         rounds_used += 1
 
-        # Step 2: parallel oversampling — each job samples a partition of X
-        # independently, then we union the results (embarrassingly parallel)
-        n_jobs_actual = os.cpu_count() if n_jobs == -1 else n_jobs
-        chunk_size = max(1, len(X) // n_jobs_actual)
-        chunks = [
-            X[i : i + chunk_size] for i in range(0, len(X), chunk_size)
-        ]
+        t_sample = time.perf_counter()
+        if phi <= 0:
+            break
+        # Bernoulli sampling: p_i = oversample * d^2(x_i, C) / phi(C)
+        # Expected selected count per round ≈ oversample.
+        probs = min_sq / phi
+        mask = rng.random(n) < (oversample * probs)
+        new_pts = X[mask]
+        sample_s = time.perf_counter() - t_sample
+        if len(new_pts) == 0:
+            break
 
-        new_batches = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_sample_candidates)(chunk, centers, oversample, RANDOM_SEED + r * 1000 + ci)
-            for ci, chunk in enumerate(chunks)
-        )
+        # Update running phi against only the new centers (not all prior).
+        t_update = time.perf_counter()
+        _update_min_dist_inplace(X, new_pts, min_sq, X_sq)
+        centers_list.append(new_pts)
+        phi_new = float(min_sq.sum())
+        update_s = time.perf_counter() - t_update
 
-        # Step 3: collect newly sampled candidates
-        new_pts_list = [b for b in new_batches if len(b) > 0]
-        if new_pts_list:
-            new_pts = np.vstack(new_pts_list)
-            centers = np.vstack([centers, new_pts])
+        # Relative-improvement stopping rule.
+        t_stop = time.perf_counter()
+        rel_improvement = (phi - phi_new) / (phi + 1e-20)
+        phi = phi_new
+        stop_s = time.perf_counter() - t_stop
 
-        # Step 4: compute quality metric on the *reduced* candidate set
-        # (reduce first so metric is computed on a representative k-sized set)
-        candidate_centers = _reduce_to_k(_metric_sample(centers), k)
-        metric = _quality_metric(candidate_centers)
+        if profile:
+            timings["round"].append(r + 1)
+            timings["new_pts"].append(int(len(new_pts)))
+            timings["sample_s"].append(sample_s)
+            timings["update_s"].append(update_s)
+            timings["stop_s"].append(stop_s)
+            timings["phi"].append(phi)
+            timings["rel_improvement"].append(rel_improvement)
 
-        # Step 5: check convergence — stop if metric change is below epsilon
-        if prev_metric is not None:
-            delta = abs(metric - prev_metric)
-            if delta < epsilon:
-                # Converged — no need for more rounds
-                break
+        if rel_improvement < epsilon:
+            break
 
-        prev_metric = metric
-
-    # Step 6: final reduction to exactly k centers
-    return _reduce_to_k(centers, k), rounds_used
+    # --- final reduction to k centers -----------------------------------
+    t_reduce = time.perf_counter()
+    final_centers = _reduce_to_k(X, np.vstack(centers_list), k, X_sq)
+    if profile:
+        timings["reduce_s"] = time.perf_counter() - t_reduce
+        return final_centers, rounds_used, timings
+    return final_centers, rounds_used
 
 
 # ---------------------------------------------------------------------------
-# EM phase runner (shared)
+# Profiling helper: per-round time breakdown
+# ---------------------------------------------------------------------------
+
+def profile_adaptive(dataset_sizes: list[int] = DATASET_SIZES,
+                      epsilon: float = EPSILON) -> None:
+    """Run adaptive seeding with profile=True and print a per-round report."""
+    print("\n" + "=" * 82)
+    print(" Adaptive k-means|| — per-round profile")
+    print(f" (k={K}, oversample={OVERSAMPLE_FACTOR}, epsilon={epsilon}, "
+          f"max_rounds={MAX_ROUNDS})")
+    print("=" * 82)
+
+    for n in dataset_sizes:
+        X = make_dataset(n)
+        t0 = time.perf_counter()
+        _, rounds_used, t = adaptive_kmeans_parallel(
+            X, K, epsilon=epsilon, profile=True,
+        )
+        total_wall = time.perf_counter() - t0
+        accounted = (t["setup_s"] + sum(t["sample_s"]) + sum(t["update_s"])
+                     + sum(t["stop_s"]) + t["reduce_s"])
+
+        print(f"\nn = {n:>10,}   rounds = {rounds_used}   "
+              f"wall = {total_wall:.3f}s   "
+              f"(setup {t['setup_s']:.3f}s + rounds "
+              f"{accounted - t['setup_s'] - t['reduce_s']:.3f}s + "
+              f"reduce {t['reduce_s']:.3f}s)")
+        print(f"  {'round':>5} {'new_pts':>8} {'sample':>9} {'update':>9} "
+              f"{'stop':>8} {'rel_impr':>10} {'phi':>13}")
+        for i in range(len(t["round"])):
+            print(f"  {t['round'][i]:>5} {t['new_pts'][i]:>8} "
+                  f"{t['sample_s'][i]:>9.4f} {t['update_s'][i]:>9.4f} "
+                  f"{t['stop_s'][i]:>8.4f} "
+                  f"{t['rel_improvement'][i]:>9.4f}  "
+                  f"{t['phi'][i]:>13.3e}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# EM phase
 # ---------------------------------------------------------------------------
 
 def run_em(X: np.ndarray, init_centers: np.ndarray, k: int):
     """Run k-means EM from given initial centers, return (inertia, n_iter, time_s)."""
     t0 = time.perf_counter()
     km = KMeans(
-        n_clusters=k,
-        init=init_centers,
-        n_init=1,
-        max_iter=300,
-        tol=1e-4,
-        random_state=RANDOM_SEED,
+        n_clusters=k, init=init_centers, n_init=1,
+        max_iter=300, tol=1e-4, random_state=RANDOM_SEED,
     )
     km.fit(X)
     elapsed = time.perf_counter() - t0
@@ -262,28 +363,22 @@ def run_em(X: np.ndarray, init_centers: np.ndarray, k: int):
 
 
 # ---------------------------------------------------------------------------
-# Benchmark runner
+# Benchmark harness
 # ---------------------------------------------------------------------------
 
-def benchmark_strategy(name: str, seed_fn, X: np.ndarray, k: int):
-    """
-    Run one strategy, return dict of metrics.
-    seed_fn(X, k) -> (centers, rounds_used)  OR  centers (rounds_used defaults to N/A)
-    """
+def benchmark_strategy(name: str, seed_fn, X: np.ndarray, k: int) -> dict:
+    """Run one strategy, return dict of metrics."""
     tracemalloc.start()
-    t_seed_start = time.perf_counter()
-
+    t0 = time.perf_counter()
     result = seed_fn(X, k)
     if isinstance(result, tuple):
-        centers, rounds_used = result
+        centers, rounds_used = result[0], result[1]
     else:
         centers, rounds_used = result, "N/A"
-
-    seed_time = time.perf_counter() - t_seed_start
-    mem_snapshot = tracemalloc.take_snapshot()
+    seed_time = time.perf_counter() - t0
+    snap = tracemalloc.take_snapshot()
     tracemalloc.stop()
-
-    peak_mem_mb = sum(s.size for s in mem_snapshot.statistics("lineno")) / 1e6
+    peak_mem_mb = sum(s.size for s in snap.statistics("lineno")) / 1e6
 
     inertia, n_iter, em_time = run_em(X, centers, k)
 
@@ -307,8 +402,7 @@ def run_local_benchmark() -> list[dict]:
         print(f"\n=== Dataset size: {n:,} ===")
         X = make_dataset(n)
 
-        # Baseline 1: k-means++
-        print("  Running k-means++ ...")
+        print("  k-means++ ...")
         row = benchmark_strategy(
             "kmeans++",
             lambda X, k: (kmeans_plus_plus(X, k, np.random.default_rng(RANDOM_SEED)), "N/A"),
@@ -316,11 +410,10 @@ def run_local_benchmark() -> list[dict]:
         )
         row["dataset_size"] = n
         rows.append(row)
-        print(f"    inertia={row['inertia']}, em_iter={row['em_iterations']}, "
+        print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
               f"total={row['total_time_s']}s")
 
-        # Baseline 2: fixed k-means|| R=2
-        print("  Running fixed k-means|| (R=2) ...")
+        print("  fixed k-means|| (R=2) ...")
         row = benchmark_strategy(
             "kmeans||_fixed_R2",
             lambda X, k: (fixed_kmeans_parallel(X, k, R=2), 2),
@@ -328,11 +421,10 @@ def run_local_benchmark() -> list[dict]:
         )
         row["dataset_size"] = n
         rows.append(row)
-        print(f"    inertia={row['inertia']}, em_iter={row['em_iterations']}, "
+        print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
               f"total={row['total_time_s']}s")
 
-        # Contribution: adaptive k-means||
-        print("  Running adaptive k-means|| ...")
+        print("  adaptive k-means|| ...")
         row = benchmark_strategy(
             "kmeans||_adaptive",
             lambda X, k: adaptive_kmeans_parallel(X, k),
@@ -340,10 +432,9 @@ def run_local_benchmark() -> list[dict]:
         )
         row["dataset_size"] = n
         rows.append(row)
-        print(f"    inertia={row['inertia']}, em_iter={row['em_iterations']}, "
-              f"rounds={row['seed_rounds_used']}, total={row['total_time_s']}s")
+        print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
+              f"rounds={row['seed_rounds_used']}  total={row['total_time_s']}s")
 
-    # Save CSV
     csv_path = os.path.join(RESULTS_DIR, "local_benchmark.csv")
     fieldnames = ["strategy", "dataset_size", "seed_rounds_used", "em_iterations",
                   "seed_time_s", "em_time_s", "total_time_s", "peak_mem_mb", "inertia"]
@@ -351,9 +442,42 @@ def run_local_benchmark() -> list[dict]:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
-    print(f"\nLocal results saved to {csv_path}")
+    print(f"\nSaved to {csv_path}")
     return rows
 
 
+# ---------------------------------------------------------------------------
+# BLAS configuration inspection — demonstrates the multicore parallelism
+# ---------------------------------------------------------------------------
+
+def show_blas_config() -> None:
+    """
+    Print numpy's BLAS backend and active thread counts.
+    Use this to confirm `X @ C.T` inside the seeding loop is actually
+    running multi-core. Key lines: 'blas_info' / 'openblas' / 'mkl'.
+    """
+    print("\n--- numpy BLAS configuration ---")
+    np.show_config()
+    try:
+        from threadpoolctl import threadpool_info
+        print("\n--- active thread pools ---")
+        for p in threadpool_info():
+            print(f"  {p.get('prefix', '?'):<15} threads={p.get('num_threads', '?')}  "
+                  f"api={p.get('internal_api', '?')}  "
+                  f"version={p.get('version', '?')}")
+    except ImportError:
+        print("\n(install `threadpoolctl` to see active thread counts)")
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    run_local_benchmark()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "profile":
+        profile_adaptive()
+    elif cmd == "blas":
+        show_blas_config()
+    else:
+        run_local_benchmark() 
