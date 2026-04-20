@@ -56,6 +56,18 @@ def make_dataset(n_samples: int) -> np.ndarray:
     return X.astype(np.float32)
 
 
+def make_dataset_hard(n_samples: int) -> np.ndarray:
+    """High-dimensional, many clusters, heavy-tailed — where R=2 breaks down."""
+    rng = np.random.default_rng(RANDOM_SEED)
+    stds = rng.uniform(0.3, 10.0, size=50).tolist()  # k=50, wider std range
+    X, _ = make_blobs(
+        n_samples=n_samples, n_features=50,  # higher dim
+        centers=50, cluster_std=stds,
+        random_state=RANDOM_SEED,
+    )
+    return X.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # BLAS-accelerated distance primitives (shared by all k-means|| variants)
 # ---------------------------------------------------------------------------
@@ -410,6 +422,47 @@ def run_local_benchmark() -> list[dict]:
     rows = []
 
     for n in DATASET_SIZES:
+        print(f"\n=== Dataset size: {n:,} (hard) ===")
+        X = make_dataset_hard(n)
+        K_hard = 50
+
+        print("  k-means++ ...")
+        row = benchmark_strategy(
+            "kmeans++",
+            lambda X, k: (kmeans_plus_plus(X, k, np.random.default_rng(RANDOM_SEED)), "N/A"),
+            X, K_hard,
+        )
+        row["dataset_size"] = n
+        row["dataset"] = "hard"
+        rows.append(row)
+        print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
+              f"total={row['total_time_s']}s")
+
+        print("  fixed k-means|| (R=2) ...")
+        row = benchmark_strategy(
+            "kmeans||_fixed_R2",
+            lambda X, k: (fixed_kmeans_parallel(X, k, R=2), 2),
+            X, K_hard,
+        )
+        row["dataset_size"] = n
+        row["dataset"] = "hard"
+        rows.append(row)
+        print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
+              f"total={row['total_time_s']}s")
+
+        print("  adaptive k-means|| ...")
+        row = benchmark_strategy(
+            "kmeans||_adaptive",
+            lambda X, k: adaptive_kmeans_parallel(X, k),
+            X, K_hard,
+        )
+        row["dataset_size"] = n
+        row["dataset"] = "hard"
+        rows.append(row)
+        print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
+              f"rounds={row['seed_rounds_used']}  total={row['total_time_s']}s")
+
+    for n in DATASET_SIZES:
         print(f"\n=== Dataset size: {n:,} ===")
         X = make_dataset(n)
 
@@ -420,6 +473,7 @@ def run_local_benchmark() -> list[dict]:
             X, K,
         )
         row["dataset_size"] = n
+        row["dataset"] = "standard"
         rows.append(row)
         print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
               f"total={row['total_time_s']}s")
@@ -431,6 +485,7 @@ def run_local_benchmark() -> list[dict]:
             X, K,
         )
         row["dataset_size"] = n
+        row["dataset"] = "standard"
         rows.append(row)
         print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
               f"total={row['total_time_s']}s")
@@ -442,12 +497,13 @@ def run_local_benchmark() -> list[dict]:
             X, K,
         )
         row["dataset_size"] = n
+        row["dataset"] = "standard"
         rows.append(row)
         print(f"    inertia={row['inertia']:.0f}  em_iter={row['em_iterations']}  "
               f"rounds={row['seed_rounds_used']}  total={row['total_time_s']}s")
 
     csv_path = os.path.join(RESULTS_DIR, "local_benchmark.csv")
-    fieldnames = ["strategy", "dataset_size", "seed_rounds_used", "em_iterations",
+    fieldnames = ["strategy", "dataset", "dataset_size", "seed_rounds_used", "em_iterations",
                   "seed_time_s", "em_time_s", "total_time_s", "peak_mem_mb", "inertia"]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
