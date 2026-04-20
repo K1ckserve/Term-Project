@@ -271,8 +271,8 @@ def adaptive_kmeans_parallel(
         probs = min_sq / phi
         mask = rng.random(n) < (oversample * probs)
         new_pts = X[mask]
-        if len(new_pts) >  int(2*k/2):
-            idx = rng.choice(len(new_pts), size=int(2*k/2), replace=False)
+        if len(new_pts) >  int(3*k/2):
+            idx = rng.choice(len(new_pts), size=int(3*k/2), replace=False)
             new_pts = new_pts[idx]
         sample_s = time.perf_counter() - t_sample
         if len(new_pts) == 0:
