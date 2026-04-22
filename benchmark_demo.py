@@ -1,16 +1,9 @@
 """
-benchmark_suite.py — Research-level standardized testing suite for k-means seeding.
+benchmark_demo.py — Fast demonstration build of the k-means seeding benchmark.
 
-Evaluates three strategies across five data topologies and three dataset sizes,
-running N_TRIALS=5 independent trials per combination for statistical rigor.
-Each combination yields μ and σ over total_time_s, inertia, em_iterations,
-and seed_alignment_error — the geometric quality diagnostic absent from the
-original benchmark.
-
-CLI:
-    python benchmark_suite.py           # full run → results/suite_aggregate.csv
-                                        #           + results/suite_raw_trials.json
-    python benchmark_suite.py quick     # 10k + 100k, 2 trials (fast dev loop)
+Output:
+    results/demo_aggregate.csv
+    results/demo_raw_trials.json
 """
 from __future__ import annotations
 
@@ -38,16 +31,16 @@ from benchmark_local import (
 )
 
 # ---------------------------------------------------------------------------
-# Suite-level constants
+# Demo-level constants
 # ---------------------------------------------------------------------------
-N_TRIALS       = 5
-TRIAL_SEEDS    = [42, 137, 271, 512, 999]   # one per trial
+N_TRIALS       = 2
+TRIAL_SEEDS    = [42, 137]
 DATASET_SIZES  = [10_000, 100_000, 1_000_000]
-TOPOLOGIES     = ["standard", "imbalanced", "anisotropic", "high_dim", "heavy_tail"]
-K              = 20           # clusters for all topologies
-HIGH_DIM       = 100          # projection target dimensionality for high_dim
-NOISE_FRACTION = 0.10         # fraction of points replaced by uniform noise in heavy_tail
-DATASET_SEED   = 42           # fixed: geometry is held constant across trials
+TOPOLOGIES     = ["standard", "anisotropic", "high_dim", "heavy_tail"]
+K              = 20
+HIGH_DIM       = 100
+NOISE_FRACTION = 0.10
+DATASET_SEED   = 42
 RESULTS_DIR    = "results"
 
 
@@ -56,15 +49,8 @@ RESULTS_DIR    = "results"
 # ---------------------------------------------------------------------------
 
 class DatasetSuite:
-    """
-    Generates labelled datasets of varying geometries.
-    Every method returns (X, true_centers) where true_centers are the
-    ground-truth generating positions used to compute seed_alignment_error.
-    """
-
     @staticmethod
     def standard(n: int, seed: int = DATASET_SEED):
-        """Symmetric, well-separated Gaussian blobs in 10 dimensions."""
         rng = np.random.default_rng(seed)
         stds = rng.uniform(0.5, 3.0, size=K).tolist()
         X, _, centers = make_blobs(
@@ -75,12 +61,10 @@ class DatasetSuite:
 
     @staticmethod
     def imbalanced(n: int, seed: int = DATASET_SEED):
-        """3 dominant clusters (90 % of points) + 17 sparse clusters (10 %)."""
         rng = np.random.default_rng(seed)
-        K_large, K_small = 3, 17          # K_large + K_small == K
+        K_large, K_small = 3, 17
         n_large = int(n * 0.90)
         n_small = n - n_large
-
         X_large, _, c_large = make_blobs(
             n_samples=n_large, n_features=10, centers=K_large,
             cluster_std=rng.uniform(0.5, 2.0, size=K_large).tolist(),
@@ -98,13 +82,11 @@ class DatasetSuite:
 
     @staticmethod
     def anisotropic(n: int, seed: int = DATASET_SEED):
-        """Elongated blobs: a random per-axis stretch is applied to standard blobs."""
         rng = np.random.default_rng(seed)
         X_raw, _, centers_raw = make_blobs(
             n_samples=n, n_features=10, centers=K,
             cluster_std=1.0, random_state=seed, return_centers=True,
         )
-        # Diagonal stretch matrix — different scale per axis to break sphericity
         stretch = np.diag(rng.uniform(0.1, 5.0, size=10)).astype(np.float32)
         X = (X_raw @ stretch).astype(np.float32)
         centers = (centers_raw @ stretch).astype(np.float32)
@@ -112,14 +94,11 @@ class DatasetSuite:
 
     @staticmethod
     def high_dim(n: int, seed: int = DATASET_SEED):
-        """Standard blobs projected from 10-d into HIGH_DIM dimensions."""
         rng = np.random.default_rng(seed)
         X_raw, _, centers_raw = make_blobs(
             n_samples=n, n_features=10, centers=K,
             cluster_std=1.0, random_state=seed, return_centers=True,
         )
-        # Johnson-Lindenstrauss-style projection: scale by 1/sqrt(d_out) to
-        # approximately preserve pairwise distances in expectation.
         proj = (rng.standard_normal((10, HIGH_DIM)) / np.sqrt(HIGH_DIM)).astype(np.float32)
         X = (X_raw @ proj).astype(np.float32)
         centers = (centers_raw @ proj).astype(np.float32)
@@ -127,7 +106,6 @@ class DatasetSuite:
 
     @staticmethod
     def heavy_tail(n: int, seed: int = DATASET_SEED):
-        """Gaussian blobs with NOISE_FRACTION of points replaced by uniform outliers."""
         rng = np.random.default_rng(seed)
         X, _, centers = make_blobs(
             n_samples=n, n_features=10, centers=K,
@@ -156,20 +134,11 @@ TOPOLOGY_FNS: dict[str, callable] = {
 # ---------------------------------------------------------------------------
 
 def seed_alignment_error(seeds: np.ndarray, true_centers: np.ndarray) -> float:
-    """
-    Mean minimum Euclidean distance from each chosen seed to its nearest true center.
-
-    Lower is better. Proves whether the seeding phase recovers the underlying
-    cluster structure prior to EM — independent of convergence quality.
-
-    Uses the same x·c BLAS identity as _sq_dist_matrix so it stays consistent
-    with the distance metric used throughout the algorithms.
-    """
     s = seeds.astype(np.float64)
     t = true_centers.astype(np.float64)
     s_sq = np.einsum("ij,ij->i", s, s)
     t_sq = np.einsum("ij,ij->i", t, t)
-    D = s @ t.T          # (K, K_true)
+    D = s @ t.T
     D *= -2
     D += s_sq[:, None]
     D += t_sq[None, :]
@@ -179,17 +148,10 @@ def seed_alignment_error(seeds: np.ndarray, true_centers: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Strategy factories — return (name, callable) pairs wired to a trial seed
+# Strategy factories
 # ---------------------------------------------------------------------------
 
 def make_strategies(trial_seed: int) -> list[tuple[str, callable]]:
-    """
-    Build seed-function callables for a single trial.
-
-    Each callable matches the signature  f(X, k) → (centers, rounds_or_NA).
-    The dataset geometry is identical across trials; only the algorithm's
-    internal RNG varies so that σ reflects pure seeding stochasticity.
-    """
     return [
         (
             "kmeans++",
@@ -226,11 +188,6 @@ def run_trial(
     n_samples: int,
     trial_idx: int,
 ) -> dict:
-    """
-    Execute one trial: seed phase → EM phase → full diagnostic dict.
-
-    tracemalloc wraps only the seed phase to avoid inflating em_time_s.
-    """
     tracemalloc.start()
     t0 = time.perf_counter()
     result = seed_fn(X, k)
@@ -248,18 +205,18 @@ def run_trial(
     inertia, n_iter, em_time = run_em(X, seeds, k)
 
     return {
-        "topology":            topology,
-        "n_samples":           n_samples,
-        "strategy":            strategy_name,
-        "trial_idx":           trial_idx,
-        "seed_time_s":         round(seed_time, 5),
-        "em_time_s":           round(em_time, 5),
-        "total_time_s":        round(seed_time + em_time, 5),
-        "em_iterations":       int(n_iter),
-        "final_inertia":       round(float(inertia), 2),
+        "topology":             topology,
+        "n_samples":            n_samples,
+        "strategy":             strategy_name,
+        "trial_idx":            trial_idx,
+        "seed_time_s":          round(seed_time, 5),
+        "em_time_s":            round(em_time, 5),
+        "total_time_s":         round(seed_time + em_time, 5),
+        "em_iterations":        int(n_iter),
+        "final_inertia":        round(float(inertia), 2),
         "seed_alignment_error": round(align_err, 6),
-        "seed_rounds_used":    rounds_used if rounds_used != "N/A" else None,
-        "peak_mem_mb":         round(peak_mem_mb, 2),
+        "seed_rounds_used":     rounds_used if rounds_used != "N/A" else None,
+        "peak_mem_mb":          round(peak_mem_mb, 2),
     }
 
 
@@ -272,29 +229,6 @@ _AGG_FIELDS = [
     "em_iterations", "final_inertia", "seed_alignment_error",
 ]
 
-
-def aggregate_trials(trials: list[dict]) -> dict:
-    """
-    Compute μ and σ (ddof=1) across N trials for one (topology, n_samples, strategy) group.
-    Returns a flat dict ready to be written as a CSV row.
-    """
-    base = {k: trials[0][k] for k in ("topology", "n_samples", "strategy")}
-    for field in _AGG_FIELDS:
-        vals = np.array([t[field] for t in trials], dtype=float)
-        base[f"{field}_mean"] = round(float(vals.mean()), 6)
-        base[f"{field}_std"]  = round(float(vals.std(ddof=1)), 6)
-
-    rounds_vals = [t["seed_rounds_used"] for t in trials
-                   if t["seed_rounds_used"] is not None]
-    base["rounds_mean"] = (round(float(np.mean(rounds_vals)), 2)
-                           if rounds_vals else None)
-    return base
-
-
-# ---------------------------------------------------------------------------
-# Aggregate CSV column order
-# ---------------------------------------------------------------------------
-
 _STRATEGY_NAMES = ["kmeans++", "kmeans||_fixed_R2", "kmeans||_adaptive"]
 
 _AGG_CSV_FIELDS = (
@@ -304,11 +238,24 @@ _AGG_CSV_FIELDS = (
 )
 
 
+def aggregate_trials(trials: list[dict]) -> dict:
+    base = {k: trials[0][k] for k in ("topology", "n_samples", "strategy")}
+    for field in _AGG_FIELDS:
+        vals = np.array([t[field] for t in trials], dtype=float)
+        base[f"{field}_mean"] = round(float(vals.mean()), 6)
+        base[f"{field}_std"]  = round(float(vals.std(ddof=1)), 6)
+    rounds_vals = [t["seed_rounds_used"] for t in trials
+                   if t["seed_rounds_used"] is not None]
+    base["rounds_mean"] = (round(float(np.mean(rounds_vals)), 2)
+                           if rounds_vals else None)
+    return base
+
+
 # ---------------------------------------------------------------------------
-# Main suite runner
+# Main demo runner
 # ---------------------------------------------------------------------------
 
-def run_suite(sizes: list[int] = DATASET_SIZES, n_trials: int = N_TRIALS) -> None:
+def run_demo(sizes: list[int] = DATASET_SIZES, n_trials: int = N_TRIALS) -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     all_raw: list[dict] = []
@@ -325,10 +272,7 @@ def run_suite(sizes: list[int] = DATASET_SIZES, n_trials: int = N_TRIALS) -> Non
             combo_idx += 1
             print(f"\n[{combo_idx}/{total_combos}]  topology={topology:<12}  n={n:>10,}")
 
-            # Generate once; hold geometry constant across all trials so that
-            # trial-to-trial variance reflects algorithm randomness, not data shuffle.
             X, true_centers = gen_fn(n, seed=DATASET_SEED)
-
             combo_raw: dict[str, list[dict]] = {name: [] for name in _STRATEGY_NAMES}
 
             for trial_idx, trial_seed in enumerate(seeds):
@@ -368,15 +312,12 @@ def run_suite(sizes: list[int] = DATASET_SIZES, n_trials: int = N_TRIALS) -> Non
             for name in _STRATEGY_NAMES:
                 all_agg.append(aggregate_trials(combo_raw[name]))
 
-    # ------------------------------------------------------------------
-    # Persist results
-    # ------------------------------------------------------------------
-    raw_path = os.path.join(RESULTS_DIR, "suite_raw_trials.json")
+    raw_path = os.path.join(RESULTS_DIR, "demo_raw_trials.json")
     with open(raw_path, "w") as f:
         json.dump(all_raw, f, indent=2)
     print(f"\nRaw trials  -> {raw_path}  ({len(all_raw)} rows)")
 
-    agg_path = os.path.join(RESULTS_DIR, "suite_aggregate.csv")
+    agg_path = os.path.join(RESULTS_DIR, "demo_aggregate.csv")
     with open(agg_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_AGG_CSV_FIELDS)
         w.writeheader()
@@ -392,9 +333,4 @@ def run_suite(sizes: list[int] = DATASET_SIZES, n_trials: int = N_TRIALS) -> Non
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "quick":
-        # Fast smoke-test: skip 1M, only 2 trials
-        run_suite(sizes=[10_000, 100_000], n_trials=2)
-    else:
-        run_suite()
+    run_demo()

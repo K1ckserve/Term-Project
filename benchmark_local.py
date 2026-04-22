@@ -4,16 +4,8 @@ benchmark_local.py — Multicore benchmark for adaptive k-means||.
 Baselines:
     - kmeans_plus_plus       : k-means++ (sequential, O(nkd))
     - fixed_kmeans_parallel  : fixed-round k-means|| (R=2, Spark default)
-
 Contribution:
     - adaptive_kmeans_parallel : adaptive k-means|| with phi-based early stopping
-
-All three strategies share BLAS-based squared-distance primitives so the
-comparison reflects algorithmic differences, not implementation artefacts.
-Parallelism is inherited from numpy's BLAS backend (MKL/OpenBLAS) via
-`X @ C.T` matmuls. Run `python benchmark_local.py blas` to verify which
-BLAS is linked and how many threads it uses.
-
 CLI:
     python benchmark_local.py            # full benchmark → results/local_benchmark.csv
     python benchmark_local.py profile    # per-round timing breakdown of adaptive
@@ -77,13 +69,9 @@ def _sq_dist_matrix(X: np.ndarray, C: np.ndarray,
     """
     Squared Euclidean distance matrix, shape (|X|, |C|).
 
-    Uses the identity  ||x - c||^2 = ||x||^2 + ||c||^2 - 2 x·c  so the
+    ||x - c||^2 = ||x||^2 + ||c||^2 - 2 x·c  so the
     dominant operation is a single matmul, dispatched to BLAS with native
-    multithreading. Typically 3-5x faster than scipy.cdist for numerical
-    arrays, and scales with available cores.
-
-    Pass X_sq to avoid recomputing the ||X||^2 row-norms when X is fixed.
-    All intermediate allocations are kept in float32.
+    multithreading.
     """
     if X_sq is None:
         X_sq = np.einsum("ij,ij->i", X, X)
@@ -116,7 +104,7 @@ def _reduce_to_k(X: np.ndarray, candidates: np.ndarray, k: int,
         )
         return candidates[idx]
         
-    # Calculate weights: find the nearest candidate for every point in X
+    # Calculate weights
     D = _sq_dist_matrix(X, candidates, X_sq=X_sq)
     closest_candidate_idx = D.argmin(axis=1)
     
@@ -139,11 +127,7 @@ def _reduce_to_k(X: np.ndarray, candidates: np.ndarray, k: int,
 def kmeans_plus_plus(X: np.ndarray, k: int,
                      rng: np.random.Generator) -> np.ndarray:
     """
-    Standard k-means++ seeding: O(nkd) sequential.
-
-    Maintains a running min-squared-distance array and updates it only
-    against the most recently added center each iteration — the canonical
-    efficient formulation (vs. recomputing against all prior centers).
+    Standard k-means++ seeding
     """
     n, d = X.shape
     first = int(rng.integers(0, n))
@@ -178,9 +162,7 @@ def fixed_kmeans_parallel(X: np.ndarray, k: int, R: int = 2,
                            seed: int = RANDOM_SEED,
                            ) -> np.ndarray:
     """
-    Fixed-round k-means|| seeding — runs exactly R oversampling rounds.
-    Uses the same BLAS primitives and incremental-update strategy as the
-    adaptive variant so the two differ only in their stopping rule.
+    Fixed-round k-means|| seeding
     """
     rng = np.random.default_rng(seed)
     n = len(X)
@@ -229,24 +211,9 @@ def adaptive_kmeans_parallel(
     halt when the potential function
         phi(C) = sum_i  min_c  ||x_i - c||^2
     drops by less than `epsilon` fraction between consecutive rounds
-    (diminishing-returns signal). phi is monotonically non-increasing,
-    so no oscillation pathology — unlike ratio-of-distances metrics.
-
-    phi is computed as a free by-product of the sampling distribution
-    (the Bernoulli probabilities already require the min-distance array),
+    (diminishing-returns signal). phi is computed as a free by-product of the sampling distribution,
     so there is zero extra distance-computation overhead for the
     convergence check.
-
-    Parameters
-    ----------
-    profile : bool
-        If True, capture per-round timings and return them in a dict as
-        a third tuple element. Overhead when False: ~0 (no extra calls).
-
-    Returns
-    -------
-    (centers, rounds_used)                if profile=False
-    (centers, rounds_used, timings_dict)  if profile=True
     """
     rng = np.random.default_rng(seed)
     n = len(X)
@@ -280,7 +247,7 @@ def adaptive_kmeans_parallel(
         t_sample = time.perf_counter()
         if phi <= 0:
             break
-        # Bernoulli sampling: p_i = oversample * d^2(x_i, C) / phi(C)
+        # Bernoulli sampling
         # Expected selected count per round ≈ oversample.
         probs = min_sq / phi
         mask = rng.random(n) < (oversample * probs)
@@ -295,10 +262,6 @@ def adaptive_kmeans_parallel(
         # Update running phi against only the new centers (not all prior).
         t_update = time.perf_counter()
         _update_min_dist_inplace(X, new_pts, min_sq, X_sq)
-        # CHUNK_SIZE = 50000
-        # for i in range(0,n,CHUNK_SIZE):
-        #     chunk = X[i:i + CHUNK_SIZE]
-        #     _update_min_dist_inplace(chunk, new_pts, min_sq[i:i+CHUNK_SIZE], X_sq[i:i+CHUNK_SIZE])
         centers_list.append(new_pts)
         phi_new = float(min_sq.sum())
         update_s = time.perf_counter() - t_update
@@ -338,7 +301,7 @@ def adaptive_kmeans_parallel(
 
 def profile_adaptive(dataset_sizes: list[int] = DATASET_SIZES,
                       epsilon: float = EPSILON) -> None:
-    """Run adaptive seeding with profile=True and print a per-round report."""
+    """Run adaptive seeding"""
     print("\n" + "=" * 82)
     print(" Adaptive k-means|| — per-round profile")
     print(f" (k={K}, oversample={OVERSAMPLE_FACTOR}, epsilon={epsilon}, "
@@ -522,8 +485,6 @@ def run_local_benchmark() -> list[dict]:
 def show_blas_config() -> None:
     """
     Print numpy's BLAS backend and active thread counts.
-    Use this to confirm `X @ C.T` inside the seeding loop is actually
-    running multi-core. Key lines: 'blas_info' / 'openblas' / 'mkl'.
     """
     print("\n--- numpy BLAS configuration ---")
     np.show_config()
